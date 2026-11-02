@@ -1,0 +1,102 @@
+vtest "selection = HASH: a retry goes to the next address"
+
+# selection.localhost must resolve to both 127.0.0.1 and 127.0.0.2, see
+# selection.vtc. Only 127.0.0.1 answers; 127.0.0.2 refuses connections but,
+# without a probe, counts as healthy - like a replica that stopped before its
+# probe noticed. Objects that hash to it must succeed on the retry.
+feature cmd "getent ahostsv4 selection.localhost | grep -q 127.0.0.2"
+
+server s1 -listen "127.0.0.1 0" -repeat 16 {
+	rxreq
+	txresp -hdr "Connection: close"
+} -start
+
+vcache v1 -vcl {
+	import dynamic;
+
+	backend default none;
+
+	sub vcl_init {
+		new dh = dynamic.director(port = "${s1_port}", selection = HASH);
+	}
+
+	sub vcl_recv {
+		set req.backend_hint = dh.backend("selection.localhost");
+		return (pass);
+	}
+
+	sub vcl_hash {
+		hash_data(req.url);
+		hash_data(req.http.X-Variant);
+		return (lookup);
+	}
+
+	sub vcl_backend_error {
+		if (bereq.retries < 3) {
+			return (retry);
+		}
+	}
+} -start
+
+# at least one object hashes to 127.0.0.2 first and is retried
+logexpect l1 -v v1 -g vxid {
+	expect * * FetchError {^backend dh\(127\.0\.0\.2:}
+	expect * = BerespStatus 503
+	expect * = VCL_return retry
+} -start
+
+client c1 {
+	txreq -url "/r" -hdr "X-Variant: 1"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 2"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 3"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 4"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 5"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 6"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 7"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 8"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 9"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 10"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 11"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 12"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 13"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 14"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 15"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/r" -hdr "X-Variant: 16"
+	rxresp
+	expect resp.status == 200
+} -run
+
+# all 16 answered by 127.0.0.1; some of them only on the retry
+vcache v1 -expect VBE.vcl1.dh(127.0.0.1:${s1_port}).req == 16
+vcache v1 -expect VBE.vcl1.dh(127.0.0.1:${s1_port}).fail == 0
+logexpect l1 -wait

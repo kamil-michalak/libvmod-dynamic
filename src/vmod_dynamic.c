@@ -399,14 +399,49 @@ sel_key(VRT_CTX, enum dynamic_selection_e sel, uint64_t *key)
 	}
 }
 
-/* healthy backend with the highest score for key, NULL if none */
+static inline uint64_t
+sel_score(const struct dynamic_ref *r, uint64_t key)
+{
+	const char *name;
+
+	name = r->dir->vcl_name;
+	AN(name);
+	return (sel_mix(key ^ sel_mix(sel_fnv1a(name, strlen(name)))));
+}
+
+/* strict order of (score, ref): the ref address only breaks score ties */
+static inline int
+sel_below(uint64_t s1, const struct dynamic_ref *r1, uint64_t s2,
+    const struct dynamic_ref *r2)
+{
+	return (s1 < s2 || (s1 == s2 && (uintptr_t)r1 < (uintptr_t)r2));
+}
+
+static inline int
+sel_usable(VRT_CTX, const struct dynamic_ref *r)
+{
+	VCL_TIME c;
+
+	CHECK_OBJ_NOTNULL(r, DYNAMIC_REF_MAGIC);
+	if (r->dir == creating || r->dir == NULL)
+		return (0);
+	return (VRT_Healthy(ctx, r->dir, &c));
+}
+
+/*
+ * Healthy backend for key, NULL if none. The first fetch gets the highest
+ * score; a retry (bereq.retries = n) gets the n-th next one in score order
+ * (modulo the number of healthy backends), so a fetch that failed on an
+ * address which is still considered healthy (e.g. a replica stopped before
+ * its probe noticed) is retried on another one, like round robin used to do,
+ * and every retry of the same object takes the same path.
+ */
 static struct dynamic_ref *
 dom_select(VRT_CTX, struct dynamic_domain *dom, uint64_t key)
 {
-	struct dynamic_ref *r, *best = NULL;
-	uint64_t score, best_score = 0;
-	const char *name;
-	VCL_TIME c;
+	struct dynamic_ref *r, *best, *prev = NULL;
+	uint64_t score, best_score, prev_score = 0;
+	unsigned n = 0, rank = 0, i;
 
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 	CHECK_OBJ_NOTNULL(dom, DYNAMIC_DOMAIN_MAGIC);
@@ -414,21 +449,38 @@ dom_select(VRT_CTX, struct dynamic_domain *dom, uint64_t key)
 	if (! dom_is_active(dom, 1))
 		return (NULL);
 
-	VTAILQ_FOREACH(r, &dom->refs, list) {
-		CHECK_OBJ_NOTNULL(r, DYNAMIC_REF_MAGIC);
-		if (r->dir == creating || r->dir == NULL)
-			continue;
-		if (! VRT_Healthy(ctx, r->dir, &c))
-			continue;
-		name = r->dir->vcl_name;
-		AN(name);
-		score = sel_mix(key ^ sel_mix(sel_fnv1a(name, strlen(name))));
-		if (best == NULL || score > best_score) {
-			best = r;
-			best_score = score;
+	VTAILQ_FOREACH(r, &dom->refs, list)
+		if (sel_usable(ctx, r))
+			n++;
+	if (n == 0)
+		return (NULL);
+	if (ctx->bo != NULL)
+		rank = ctx->bo->retries % n;
+
+	for (i = 0; i <= rank; i++) {
+		best = NULL;
+		best_score = 0;
+		VTAILQ_FOREACH(r, &dom->refs, list) {
+			if (! sel_usable(ctx, r))
+				continue;
+			score = sel_score(r, key);
+			// rounds after the first: only below the previous pick
+			if (prev != NULL &&
+			    ! sel_below(score, r, prev_score, prev))
+				continue;
+			if (best == NULL ||
+			    sel_below(best_score, best, score, r)) {
+				best = r;
+				best_score = score;
+			}
 		}
+		// health changed between the count and this round
+		if (best == NULL)
+			break;
+		prev = best;
+		prev_score = best_score;
 	}
-	return (best);
+	return (prev);
 }
 
 static VCL_BACKEND v_matchproto_(vdi_resolve_f)

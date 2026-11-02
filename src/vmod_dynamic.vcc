@@ -391,6 +391,13 @@ Parameters:
 	  returns. An address that is replaced by a new one (new IP)
 	  counts as a new address.
 
+	  A retry (``return (retry)``, ``bereq.retries`` = *n*) uses the
+	  *n*-th next address in the object's / URL's score order
+	  (modulo the number of healthy addresses), so a fetch that
+	  failed on an address still considered healthy - for example
+	  one that stopped before its probe noticed - is retried on
+	  another address, as with ``ROUND_ROBIN``.
+
 	  If no address is healthy, or the request hash / URL is not
 	  available (e.g. the director is resolved outside a request),
 	  selection falls back to ``ROUND_ROBIN``.
