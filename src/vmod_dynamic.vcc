@@ -252,13 +252,15 @@ $Object director(
 	INT keep				= 3,
 	STRING authority			= NULL,
 	DURATION wait_timeout = -1,
-	INT wait_limit = 0)
+	INT wait_limit = 0,
+	ENUM { ROUND_ROBIN, HASH, URL } selection = "ROUND_ROBIN")
 
 Description
 	Create a DNS director.
 
 	The director creates backends with DNS lookups and chooses them in a
-	round robin fashion. It accepts the following
+	round robin fashion by default, or by a hash of the request, see
+	`selection`_. It accepts the following
 
 Parameters:
 	- *port* (defaults to ``"http"``)
@@ -365,6 +367,33 @@ Parameters:
 	  The ``keep`` value must not be negative and it is capped to
 	  a high positive value (``UINT_MAX``, usually 4 294 967 295,
 	  see :ref:`limits.h(7POSIX)`).
+
+.. _selection:
+
+	- *selection* (default: ``ROUND_ROBIN``)
+
+	  How a backend is chosen among the addresses a domain resolves
+	  to:
+
+	  - ``ROUND_ROBIN``: one after the other (default, the
+	    behaviour of previous versions)
+	  - ``HASH``: by the hash of the object (``bereq.hash``, the
+	    result of ``vcl_hash{}``), so all fetches of one cache
+	    object go to the same address
+	  - ``URL``: by ``bereq.url`` (``req.url`` outside of backend
+	    tasks), so all fetches of one URL go to the same address
+	    regardless of other ``vcl_hash{}`` inputs
+
+	  ``HASH`` and ``URL`` use rendezvous (highest random weight)
+	  hashing over the healthy addresses: when an address goes
+	  away or becomes sick, only the requests that mapped to it
+	  move to other addresses, and they move back when it
+	  returns. An address that is replaced by a new one (new IP)
+	  counts as a new address.
+
+	  If no address is healthy, or the request hash / URL is not
+	  available (e.g. the director is resolved outside a request),
+	  selection falls back to ``ROUND_ROBIN``.
 
 Parameters to set attributes of backends
 

@@ -7,6 +7,12 @@ version 2.8.0.
 NEXT (no release branch)
 ------------------------
 
+New ``selection`` parameter of ``dynamic.director()``: ``HASH`` (by
+``bereq.hash``) and ``URL`` (by ``bereq.url``) pick the backend among a
+domain's addresses by rendezvous hashing, so all fetches of one object / URL
+go to the same address; only the keys of an address that goes away, becomes
+sick or is added move. ``ROUND_ROBIN`` stays the default.
+
 9.1 branch
 ----------
 

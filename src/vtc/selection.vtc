@@ -1,0 +1,132 @@
+vtest "selection = HASH / URL / ROUND_ROBIN"
+
+# selection.localhost must resolve to both 127.0.0.1 and 127.0.0.2, e.g. two
+# lines in /etc/hosts:
+#	127.0.0.1 selection.localhost
+#	127.0.0.2 selection.localhost
+feature cmd "getent ahostsv4 selection.localhost | grep -q 127.0.0.2"
+
+server s1 -listen "127.0.0.1 0" -repeat 100 {
+	rxreq
+	txresp -hdr "Connection: close" -hdr "X-Server: s1"
+} -start
+
+server s2 -listen "127.0.0.2 ${s1_port}" -repeat 100 {
+	rxreq
+	txresp -hdr "Connection: close" -hdr "X-Server: s2"
+} -start
+
+vcache v1 -vcl {
+	import dynamic;
+
+	backend default none;
+
+	sub vcl_init {
+		new dh = dynamic.director(port = "${s1_port}", selection = HASH);
+		new du = dynamic.director(port = "${s1_port}", selection = URL);
+		new dv = dynamic.director(port = "${s1_port}", selection = HASH);
+		new dr = dynamic.director(port = "${s1_port}");
+	}
+
+	sub vcl_recv {
+		if (req.http.X-Dir == "hash") {
+			set req.backend_hint = dh.backend("selection.localhost");
+		} elsif (req.http.X-Dir == "url") {
+			set req.backend_hint = du.backend("selection.localhost");
+		} elsif (req.http.X-Dir == "variants") {
+			set req.backend_hint = dv.backend("selection.localhost");
+		} else {
+			set req.backend_hint = dr.backend("selection.localhost");
+		}
+		# every request is fetched, so the backend counters show the choice
+		return (pass);
+	}
+
+	sub vcl_hash {
+		hash_data(req.url);
+		hash_data(req.http.X-Variant);
+		return (lookup);
+	}
+} -start
+
+# HASH: one object (same URL and variant), six fetches, one address
+client c1 -repeat 6 {
+	txreq -url "/one" -hdr "X-Dir: hash" -hdr "X-Variant: a"
+	rxresp
+	expect resp.status == 200
+} -run
+
+# URL: one URL, six different vcl_hash variants, still one address
+client c2 {
+	txreq -url "/two" -hdr "X-Dir: url" -hdr "X-Variant: 1"
+	rxresp
+	txreq -url "/two" -hdr "X-Dir: url" -hdr "X-Variant: 2"
+	rxresp
+	txreq -url "/two" -hdr "X-Dir: url" -hdr "X-Variant: 3"
+	rxresp
+	txreq -url "/two" -hdr "X-Dir: url" -hdr "X-Variant: 4"
+	rxresp
+	txreq -url "/two" -hdr "X-Dir: url" -hdr "X-Variant: 5"
+	rxresp
+	txreq -url "/two" -hdr "X-Dir: url" -hdr "X-Variant: 6"
+	rxresp
+	expect resp.status == 200
+} -run
+
+# HASH: sixteen different objects spread over both addresses
+client c3 {
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 1"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 2"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 3"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 4"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 5"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 6"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 7"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 8"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 9"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 10"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 11"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 12"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 13"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 14"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 15"
+	rxresp
+	txreq -url "/v" -hdr "X-Dir: variants" -hdr "X-Variant: 16"
+	rxresp
+	expect resp.status == 200
+} -run
+
+# ROUND_ROBIN (default): unchanged, alternating
+client c4 -repeat 6 {
+	txreq -url "/rr"
+	rxresp
+	expect resp.status == 200
+} -run
+
+# c1, c2: all six fetches on one of the two addresses
+shell -match "^6 0$|^0 6$" {
+	varnishstat -n ${v1_name} -1 -f 'VBE.vcl1.dh(*).req' | awk '{ v = v (NR > 1 ? " " : "") $2 } END { printf "%s", v }'
+}
+shell -match "^6 0$|^0 6$" {
+	varnishstat -n ${v1_name} -1 -f 'VBE.vcl1.du(*).req' | awk '{ v = v (NR > 1 ? " " : "") $2 } END { printf "%s", v }'
+}
+# c3: both addresses used, 16 in total
+shell -match "^([1-9]|1[0-5]) ([1-9]|1[0-5])$" {
+	varnishstat -n ${v1_name} -1 -f 'VBE.vcl1.dv(*).req' | awk '{ v = v (NR > 1 ? " " : "") $2 } END { printf "%s", v }'
+}
+vcache v1 -expect VBE.vcl1.dr(127.0.0.1:${s1_port}).req == 3
+vcache v1 -expect VBE.vcl1.dr(127.0.0.2:${s1_port}).req == 3

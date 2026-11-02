@@ -51,6 +51,7 @@
 #include <vsb.h>
 #include <vtim.h>
 #include <vtcp.h>
+#include <vrt_obj.h>
 
 #include "vcc_dynamic_if.h"
 #include "dyn_resolver.h"
@@ -326,12 +327,117 @@ dom_find(VRT_CTX, struct dynamic_domain *dom, struct dynamic_ref *start,
 	return (next);
 }
 
+/*--------------------------------------------------------------------
+ * selection = HASH | URL: rendezvous (highest random weight) hashing.
+ *
+ * The request key is combined with the name of every healthy backend,
+ * which contains its address (see ref_add()), and the highest score wins.
+ * An address that goes away or becomes sick only moves the keys that
+ * mapped to it; nothing is precomputed, so changes of the address list
+ * need no bookkeeping.
+ */
+
+#define SEL_FNV_OFFSET	0xcbf29ce484222325ULL
+#define SEL_FNV_PRIME	0x100000001b3ULL
+
+static inline uint64_t
+sel_fnv1a(const void *p, size_t l)
+{
+	const uint8_t *b = p;
+	uint64_t h = SEL_FNV_OFFSET;
+
+	while (l--) {
+		h ^= *b++;
+		h *= SEL_FNV_PRIME;
+	}
+	return (h);
+}
+
+/* splitmix64 finalizer: spreads FNV-1a output over all 64 bits */
+static inline uint64_t
+sel_mix(uint64_t x)
+{
+	x ^= x >> 30;
+	x *= 0xbf58476d1ce4e5b9ULL;
+	x ^= x >> 27;
+	x *= 0x94d049bb133111ebULL;
+	x ^= x >> 31;
+	return (x);
+}
+
+/* hash of the request key; 0 when there is none (no task, no URL) */
+static unsigned
+sel_key(VRT_CTX, enum dynamic_selection_e sel, uint64_t *key)
+{
+	const uint8_t *digest = NULL;
+	const char *url = NULL;
+
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+	AN(key);
+
+	switch (sel) {
+	case SELECTION_HASH:
+		if (ctx->bo != NULL)
+			digest = ctx->bo->digest;
+		else if (ctx->req != NULL)
+			digest = ctx->req->digest;
+		if (digest == NULL)
+			return (0);
+		*key = sel_fnv1a(digest, DIGEST_LEN);
+		return (1);
+	case SELECTION_URL:
+		if (ctx->http_bereq != NULL)
+			url = VRT_r_bereq_url(ctx);
+		else if (ctx->http_req != NULL)
+			url = VRT_r_req_url(ctx);
+		if (url == NULL)
+			return (0);
+		*key = sel_fnv1a(url, strlen(url));
+		return (1);
+	default:
+		return (0);
+	}
+}
+
+/* healthy backend with the highest score for key, NULL if none */
+static struct dynamic_ref *
+dom_select(VRT_CTX, struct dynamic_domain *dom, uint64_t key)
+{
+	struct dynamic_ref *r, *best = NULL;
+	uint64_t score, best_score = 0;
+	const char *name;
+	VCL_TIME c;
+
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+	CHECK_OBJ_NOTNULL(dom, DYNAMIC_DOMAIN_MAGIC);
+
+	if (! dom_is_active(dom, 1))
+		return (NULL);
+
+	VTAILQ_FOREACH(r, &dom->refs, list) {
+		CHECK_OBJ_NOTNULL(r, DYNAMIC_REF_MAGIC);
+		if (r->dir == creating || r->dir == NULL)
+			continue;
+		if (! VRT_Healthy(ctx, r->dir, &c))
+			continue;
+		name = r->dir->vcl_name;
+		AN(name);
+		score = sel_mix(key ^ sel_mix(sel_fnv1a(name, strlen(name))));
+		if (best == NULL || score > best_score) {
+			best = r;
+			best_score = score;
+		}
+	}
+	return (best);
+}
+
 static VCL_BACKEND v_matchproto_(vdi_resolve_f)
 dom_resolve(VRT_CTX, VCL_BACKEND d)
 {
 	struct dynamic_domain *dom;
 	struct dynamic_ref *r;
 	VCL_BACKEND n = NULL;
+	uint64_t key;
 
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 	CHECK_OBJ_NOTNULL(d, DIRECTOR_MAGIC);
@@ -348,8 +454,15 @@ dom_resolve(VRT_CTX, VCL_BACKEND d)
 		dynamic_gc_expired(dom->obj);
 
 	Lck_Lock(&dom->mtx);
-	r = dom_find(ctx, dom, dom->current, NULL, NULL, 1);
-	dom->current = r;
+	r = NULL;
+	if (dom->obj->selection != SELECTION_ROUND_ROBIN &&
+	    sel_key(ctx, dom->obj->selection, &key))
+		r = dom_select(ctx, dom, key);
+	// round robin, also when no address is healthy or there is no key
+	if (r == NULL) {
+		r = dom_find(ctx, dom, dom->current, NULL, NULL, 1);
+		dom->current = r;
+	}
 	if (r != NULL)
 		VRT_Assign_Backend(&n, r->dir);
 	Lck_Unlock(&dom->mtx);
@@ -1289,6 +1402,17 @@ dynamic_share_parse(const char *s)
 	}
 }
 
+static inline enum dynamic_selection_e
+dynamic_selection_parse(const char *s)
+{
+	switch (s[0]) {
+	case 'R':	return SELECTION_ROUND_ROBIN;
+	case 'H':	return SELECTION_HASH;
+	case 'U':	return SELECTION_URL;
+	default:	INCOMPL();
+	}
+}
+
 static inline enum dynamic_ttl_e
 dynamic_ttl_parse(const char *s)
 {
@@ -1331,7 +1455,8 @@ vmod_director__init(VRT_CTX,
     VCL_INT keep,
     VCL_STRING authority,
     VCL_DURATION wait_timeout,
-    VCL_INT wait_limit)
+    VCL_INT wait_limit,
+    VCL_ENUM selection_arg)
 {
 	struct vmod_dynamic_director *obj;
 
@@ -1404,6 +1529,7 @@ vmod_director__init(VRT_CTX,
 	obj->max_connections = (unsigned)max_connections;
 	obj->proxy_header = (unsigned)proxy_header;
 	obj->ttl_from = dynamic_ttl_parse(ttl_from_arg);
+	obj->selection = dynamic_selection_parse(selection_arg);
 	obj->keep = (unsigned)keep;
 	obj->wait_timeout = wait_timeout;
 	obj->wait_limit = wait_limit;

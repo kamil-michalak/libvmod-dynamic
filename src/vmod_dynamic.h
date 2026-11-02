@@ -76,6 +76,12 @@ enum dynamic_ttl_e {
 	TTL_E_MAX
 };
 
+enum dynamic_selection_e {
+	SELECTION_ROUND_ROBIN = 0,
+	SELECTION_HASH,
+	SELECTION_URL
+};
+
 struct dynamic_domain {
 	unsigned			magic;
 #define DYNAMIC_DOMAIN_MAGIC		0x1bfe1345
@@ -205,6 +211,7 @@ struct vmod_dynamic_director {
 	const struct res_cb			*resolver;
 	struct VPFX(dynamic_resolver)		*resolver_inst;
 	enum dynamic_ttl_e			ttl_from;
+	enum dynamic_selection_e		selection;
 	unsigned				debug;
 };
 
